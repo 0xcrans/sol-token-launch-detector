@@ -1,0 +1,156 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Wallet Button Overrides */
+.wallet-adapter-button {
+  @apply bg-pump-purple hover:bg-purple-700 text-white font-medium px-4 py-2 rounded-lg transition-colors duration-200;
+}
+
+.wallet-adapter-button-trigger {
+  @apply bg-pump-purple hover:bg-purple-700;
+}
+
+/* Custom scrollbar - Enhanced for dark theme */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139, 92, 246, 0.6) transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.6), rgba(59, 130, 246, 0.6));
+  border-radius: 3px;
+  transition: all 0.2s ease;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.8), rgba(59, 130, 246, 0.8));
+  box-shadow: 0 0 6px rgba(139, 92, 246, 0.4);
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:active {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 1), rgba(59, 130, 246, 1));
+}
+
+.custom-scrollbar::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Enhanced horizontal scrollbar for tabs */
+.scrollbar-thin {
+  scrollbar-width: thin;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  height: 4px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 2px;
+  margin: 0 8px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: linear-gradient(90deg, rgba(139, 92, 246, 0.7), rgba(59, 130, 246, 0.7));
+  border-radius: 2px;
+  transition: all 0.3s ease;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(90deg, rgba(139, 92, 246, 0.9), rgba(59, 130, 246, 0.9));
+  box-shadow: 0 2px 8px rgba(139, 92, 246, 0.3);
+}
+
+/* Animation classes */
+.fade-in {
+  animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.pulse-glow {
+  animation: pulseGlow 2s infinite;
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 5px #8B5CF6; }
+  50% { box-shadow: 0 0 20px #8B5CF6, 0 0 30px #8B5CF6; }
+}
+
+/* Status indicators */
+.status-dot {
+  @apply w-3 h-3 rounded-full inline-block;
+}
+
+.status-online {
+  @apply bg-green-500;
+  animation: pulse 2s infinite;
+}
+
+.status-offline {
+  @apply bg-red-500;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Enhanced animations for Raydium Monitor */
+@keyframes fadeInSlideUp {
+  0% {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: 200px 0;
+  }
+}
+
+@keyframes glow {
+  0%, 100% {
+    box-shadow: 0 0 5px rgba(139, 92, 246, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(139, 92, 246, 0.8), 0 0 30px rgba(139, 92, 246, 0.6);
+  }
+}
+
+/* Utility classes for animations */
+.animate-fade-in-slide-up {
+  animation: fadeInSlideUp 0.6s ease-out forwards;
+}
+
+.animate-shimmer {
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+  background-size: 200px 100%;
+  animation: shimmer 2s infinite linear;
+}
+
+.animate-glow {
+  animation: glow 2s ease-in-out infinite;
+} 
