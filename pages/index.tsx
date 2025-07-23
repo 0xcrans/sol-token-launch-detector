@@ -13,12 +13,12 @@ const Home: NextPage = () => {
         <link rel="icon" href="/favicon.ico" />
       </Head>
       
-      <main className="min-h-screen p-4">
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 h-[calc(100vh-2rem)] max-w-full mx-auto">
-          <div className="h-full flex flex-col">
+      <main className="p-4 h-full">
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 h-full max-w-full mx-auto items-stretch">
+          <div className="h-full flex flex-col min-h-0">
             <PumpMonitor />
           </div>
-          <div className="h-full flex flex-col">
+          <div className="h-full flex flex-col min-h-0">
             <RaydiumMonitor />
           </div>
         </div>
