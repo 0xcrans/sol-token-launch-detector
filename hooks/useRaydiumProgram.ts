@@ -95,29 +95,41 @@ export const useRaydiumProgram = () => {
         // Use Helius RPC for better performance and no rate limits
         const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY;
         
-        if (!HELIUS_API_KEY) {
-          console.error('❌ NEXT_PUBLIC_HELIUS_API_KEY environment variable is required');
-          setStats(prev => ({ ...prev, isConnected: false }));
-          return;
+        let rpcUrl: string;
+        let wsUrl: string;
+        
+        if (HELIUS_API_KEY) {
+          // Use Helius RPC with API key
+          rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+          wsUrl = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+          console.log('🚀 Using Helius RPC with API key');
+        } else {
+          // Fallback to public RPC (with rate limits)
+          rpcUrl = 'https://api.mainnet-beta.solana.com';
+          wsUrl = 'wss://api.mainnet-beta.solana.com';
+          console.log('⚠️ Helius API key not found, using public RPC (limited)');
+          console.log('💡 Get free API key from: https://www.helius.dev/');
         }
         
-        const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-        
-        const conn = new Connection(HELIUS_RPC_URL, {
+        const conn = new Connection(rpcUrl, {
           commitment: 'confirmed',
-          wsEndpoint: HELIUS_RPC_URL.replace('https://', 'wss://').replace('/?', '/websocket?')
+          wsEndpoint: wsUrl
         });
 
-        // Test connection
-        await conn.getVersion();
+        // Test connection with timeout
+        const connectionPromise = conn.getVersion();
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Connection timeout')), 10000)
+        );
+        
+        await Promise.race([connectionPromise, timeoutPromise]);
         
         setConnection(conn);
         setStats(prev => ({ ...prev, isConnected: true }));
         
-        console.log('🔥 Raydium Monitor connected via Helius RPC');
+        console.log('🔥 Raydium Monitor connected successfully');
         console.log(`📡 Current slot: ${await conn.getSlot()}`);
         console.log(`🎯 Monitoring program: ${RAYDIUM_PROGRAMS.LAUNCHPAD.toString()}`);
-        console.log(`🚀 Using Helius RPC for optimal performance`);
       } catch (error) {
         console.error('❌ Failed to connect to Solana:', error);
         setStats(prev => ({ ...prev, isConnected: false }));
@@ -125,6 +137,25 @@ export const useRaydiumProgram = () => {
     };
 
     initConnection();
+    
+    // Cleanup function to prevent WebSocket errors
+    return () => {
+      if (connection) {
+        try {
+          // Clean up any active subscriptions
+          subscriptionRefs.current.forEach(subId => {
+            try {
+              connection.removeOnLogsListener(subId);
+            } catch (e) {
+              // Ignore cleanup errors
+            }
+          });
+          subscriptionRefs.current = [];
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+      }
+    };
   }, []);
 
   // ========================================================================
