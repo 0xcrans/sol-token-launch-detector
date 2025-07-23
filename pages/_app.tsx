@@ -54,8 +54,25 @@ export default function App({ Component, pageProps }: AppProps) {
     <ConnectionProvider endpoint={endpoint}>
       <WalletProvider wallets={wallets} autoConnect>
         <WalletModalProvider>
-          <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-blue-900">
-            <Component {...pageProps} />
+          <div className="h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-blue-900 flex flex-col overflow-hidden">
+            <div className="flex-1 overflow-auto">
+              <Component {...pageProps} />
+            </div>
+            <footer className="bg-black/20 backdrop-blur-sm border-t border-white/10 py-3 px-4 flex-shrink-0">
+              <div className="text-center">
+                <p className="text-sm text-gray-300">
+                  Made by{' '}
+                  <a 
+                    href="https://crans.xyz/" 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className="text-blue-400 hover:text-blue-300 transition-colors duration-200"
+                  >
+                    Crans
+                  </a>
+                </p>
+              </div>
+            </footer>
           </div>
         </WalletModalProvider>
       </WalletProvider>
