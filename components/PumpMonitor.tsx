@@ -140,17 +140,7 @@ export default function PumpMonitor() {
                         </div>
                       </div>
                     </div>
-                    
-                    {/* Launch Detection Info */}
-                    <div className="mb-3 p-3 bg-gradient-to-br from-purple-500/10 to-pink-500/10 rounded-lg border border-purple-400/20">
-                      <div className="text-purple-300 font-bold text-xs mb-2">
-                        🔥 Token Launch Detected
-                  </div>
-                      <div className="text-xs text-purple-200">
-                        🚀 New token launched on Pump.fun platform
-                      </div>
-                    </div>
-                    
+                                        
                     {/* Token Details */}
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-3">
                       <div className="bg-gradient-to-br from-purple-500/10 to-pink-500/10 rounded-lg p-3 border border-purple-400/20">
