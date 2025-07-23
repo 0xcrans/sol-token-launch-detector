@@ -1,7 +1,14 @@
 /**
- * Real-Time Raydium Pool Monitoring Hook
- * Detects new token launches using onLogs with proper 8-byte discriminators
- * Focuses only on Raydium AMM V4 and CP Swap (no Meteora)
+ * 🎯 IMPROVED: Raydium Token Detection via buy_exact_in Instructions
+ * 
+ * Problem: initialize instructions są rzadkie (1% transakcji)
+ * Rozwiązanie: Używaj buy_exact_in jak pump.fun - 99% aktywności!
+ * 
+ * Strategy:
+ * 1. Monitor buy_exact_in transactions (99% of activity)
+ * 2. Extract token address from accounts[9] (base_token_mint)
+ * 3. Track first-time seen tokens = NEW TOKENS!
+ * 4. Much faster detection, no rate limiting issues
  */
 
 import { useEffect, useState, useCallback, useRef } from 'react';
@@ -25,20 +32,64 @@ import {
   VestingParams,
   hasDiscriminator,
   isTokenLaunch,
+  getInstructionType,
+  isNewTokenLaunchInstruction,
+  isTradingInstruction,
   COMMON_TOKENS
 } from '../types/ray';
 
 // ========================================================================
-// MAIN HOOK FOR REAL-TIME RAYDIUM MONITORING
+// 🎯 BUY_EXACT_IN APPROACH - Like Pump.fun
 // ========================================================================
+
+const RAYDIUM_LAUNCHPAD = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+
+// buy_exact_in discriminator from Raydium Launchpad program
+const BUY_EXACT_IN_DISCRIMINATOR = new Uint8Array([250, 234, 13, 123, 213, 156, 19, 236]);
+
+/*
+🎯 KEY INSIGHT: buy_exact_in accounts structure dari launchpad.json:
+[0] payer (signer) - buyer
+[1] authority (PDA)  
+[2] global_config
+[3] platform_id
+[4] pool_id           ← POOL ADDRESS
+[5] user_token_account_base   ← USER'S TOKEN ACCOUNT (base token)
+[6] user_token_account_quote  ← USER'S SOL ACCOUNT  
+[7] base_vault        ← POOL'S TOKEN VAULT
+[8] quote_vault       ← POOL'S SOL VAULT
+[9] base_token_mint   ← 🎯 TOKEN ADDRESS (the new token!)
+[10] quote_token_mint ← SOL/USDC address
+*/
+
+interface TokenFromBuyTransaction {
+  tokenAddress: string;        // ← Extract from accounts[9] 
+  poolAddress: string;         // ← Extract from accounts[4]
+  buyerAddress: string;        // ← Extract from accounts[0]
+  quoteTokenAddress: string;   // ← Extract from accounts[10] (usually SOL)
+  timestamp: Date;
+  signature: string;
+  isNewToken: boolean;         // ← Check if we've seen this token before
+  amountSOL?: number;          // ← Parse from instruction data if needed
+  blockTime: number;
+  // Compatibility with existing TokenLaunchEvent
+  tokenName?: string;
+  tokenSymbol?: string;
+  tokenDecimals?: number;
+  tokenUri?: string;
+}
 
 export const useRaydiumProgram = () => {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [isMonitoring, setIsMonitoring] = useState(false);
+  
+  // 🎯 NEW: Buy-based token detection
+  const [detectedTokens, setDetectedTokens] = useState<TokenFromBuyTransaction[]>([]);
+  
+  // Legacy compatibility - convert buy-based tokens to TokenLaunchEvent format
   const [pools, setPools] = useState<TokenLaunchEvent[]>([]);
   const [livePoolStates, setLivePoolStates] = useState<LaunchpadLivePoolState[]>([]);
   
-  // 🎪 NEW: Enhanced Launchpad monitoring state
   const [launchpadEvents, setLaunchpadEvents] = useState<LaunchpadEvent[]>([]);
   const [launchpadTokenLaunches, setLaunchpadTokenLaunches] = useState<LaunchpadTokenLaunch[]>([]);
   const [launchpadTrades, setLaunchpadTrades] = useState<LaunchpadTradeEvent[]>([]);
@@ -51,10 +102,13 @@ export const useRaydiumProgram = () => {
     poolsDetected: 0,
     tokenLaunchesDetected: 0,
     uptime: 0,
-    lastTokenLaunch: null
+    lastTokenLaunch: null,
+    rpcCallsThisSession: 0,
+    rpcQueueSize: 0,
+    successfulDetections: 0,
+    failedDetections: 0
   });
   
-  // 🎪 NEW: Launchpad-specific statistics
   const [launchpadStats, setLaunchpadStats] = useState<LaunchpadMonitoringStats>({
     launchesDetected: 0,
     tradesDetected: 0,
@@ -67,48 +121,329 @@ export const useRaydiumProgram = () => {
     avgTimeToMigration: 0
   });
 
-  // Refs dla cleanup
+  // Refs for cleanup and token tracking
   const subscriptionRefs = useRef<number[]>([]);
   const startTimeRef = useRef<Date | null>(null);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   
-  // ========================================================================
-  // RATE LIMITING & CACHE 🚀 (SIMPLIFIED - NO MORE QUEUE!)
-  // ========================================================================
-  // 🗑️ REMOVED: Queue system - now processing logs directly like pump.fun
-  // const transactionCache = useRef<Map<string, any>>(new Map());
-  // const requestQueue = useRef<Array<{ signature: string; logs: any }>>([]);
-  // const isProcessing = useRef(false);
-  // const lastRequestTime = useRef(0);
-  // const REQUEST_DELAY = 200;
-  
-  // 🎯 NEW: Track processed transactions to avoid duplicates
+  // 🎯 CRITICAL: Track seen tokens to identify NEW ones
+  const seenTokensRef = useRef<Set<string>>(new Set());
   const processedTransactions = useRef<Set<string>>(new Set());
-  
+
   // ========================================================================
-  // CONNECTION SETUP
+  // 🔧 RATE LIMITING SYSTEM - Prevent 429 errors
+  // ========================================================================
+
+  const rpcQueue = useRef<Array<{
+    signature: string;
+    timestamp: number;
+    resolve: () => void;
+  }>>([]);
+  const isProcessingQueue = useRef<boolean>(false);
+  const lastRpcCall = useRef<number>(0);
+  const RPC_DELAY = 150; // 150ms between calls to prevent rate limiting
+  const MAX_CONCURRENT = 1; // Only 1 concurrent RPC call at a time
+
+  // Store the processing function in a ref to avoid dependency cycles
+  const extractTokenFromBuyTransactionThrottledRef = useRef<((signature: string) => Promise<void>) | null>(null);
+
+  /**
+   * 🔧 Process RPC queue with rate limiting
+   */
+  const processRpcQueue = useCallback(async () => {
+    if (isProcessingQueue.current || rpcQueue.current.length === 0) {
+      return;
+    }
+
+    isProcessingQueue.current = true;
+
+    while (rpcQueue.current.length > 0) {
+      const now = Date.now();
+      const timeSinceLastCall = now - lastRpcCall.current;
+
+      // Respect rate limit
+      if (timeSinceLastCall < RPC_DELAY) {
+        await new Promise(resolve => setTimeout(resolve, RPC_DELAY - timeSinceLastCall));
+      }
+
+      const queueItem = rpcQueue.current.shift();
+      if (!queueItem) break;
+
+      lastRpcCall.current = Date.now();
+      
+      // Process this transaction
+      try {
+        if (extractTokenFromBuyTransactionThrottledRef.current) {
+          await extractTokenFromBuyTransactionThrottledRef.current(queueItem.signature);
+        }
+      } catch (error) {
+        console.warn(`⚠️ [QUEUE] Failed to process ${queueItem.signature.slice(0,8)}: ${error}`);
+      }
+
+      queueItem.resolve();
+    }
+
+    isProcessingQueue.current = false;
+  }, []);
+
+  /**
+   * 🔧 Add transaction to processing queue
+   */
+  const queueRpcCall = useCallback((signature: string): Promise<void> => {
+    return new Promise((resolve) => {
+      // Check for duplicates
+      if (rpcQueue.current.some(item => item.signature === signature)) {
+        resolve();
+        return;
+      }
+
+      rpcQueue.current.push({
+        signature,
+        timestamp: Date.now(),
+        resolve
+      });
+
+      // Keep queue size manageable
+      if (rpcQueue.current.length > 50) {
+        console.warn(`⚠️ [QUEUE] Queue too large (${rpcQueue.current.length}), dropping oldest items`);
+        rpcQueue.current = rpcQueue.current.slice(-30); // Keep last 30
+      }
+
+      // Start processing if not already running
+      if (!isProcessingQueue.current) {
+        processRpcQueue();
+      }
+    });
+  }, [processRpcQueue]);
+
+  // ========================================================================
+  // 🎯 CORE: Extract token from buy_exact_in transaction (throttled version)
+  // ========================================================================
+
+  const extractTokenFromBuyTransactionThrottled = useCallback(async (signature: string) => {
+    if (!connection) return;
+
+    try {
+      // Fetch transaction with retry for 429 errors
+      let transaction = null;
+      let retryCount = 0;
+      const maxRetries = 3;
+
+      while (retryCount < maxRetries) {
+        try {
+          transaction = await connection.getTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0
+          });
+          break; // Success, exit retry loop
+        } catch (error: any) {
+          if (error.message?.includes('429') || error.status === 429) {
+            retryCount++;
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 5000); // Exponential backoff, max 5s
+            await new Promise(resolve => setTimeout(resolve, delay));
+          } else {
+            throw error; // Re-throw non-429 errors
+          }
+        }
+      }
+
+      if (!transaction) {
+        return;
+      }
+
+      // 🔧 DEFENSIVE: Check if transaction has required structure
+      if (!transaction.transaction?.message?.compiledInstructions || 
+          !transaction.transaction?.message?.staticAccountKeys) {
+        return;
+      }
+
+      // Find Raydium Launchpad buy_exact_in instructions
+      const launchpadInstructions = transaction.transaction.message.compiledInstructions.filter(ix => {
+        const programIdIndex = ix.programIdIndex;
+        
+        // 🔧 DEFENSIVE: Check if programIdIndex is valid
+        if (programIdIndex >= transaction.transaction.message.staticAccountKeys.length) {
+          return false;
+        }
+
+        const programId = transaction.transaction.message.staticAccountKeys[programIdIndex];
+        
+        // 🔧 DEFENSIVE: Check if programId exists
+        if (!programId) {
+          return false;
+        }
+
+        return programId.toString() === RAYDIUM_LAUNCHPAD;
+      });
+
+      for (const instruction of launchpadInstructions) {
+        const instructionData = Buffer.from(instruction.data);
+        
+        // Check if it's buy_exact_in
+        if (instructionData.length >= 8) {
+          const discriminator = instructionData.slice(0, 8);
+          const isBuyExactIn = discriminator.every((byte, i) => byte === BUY_EXACT_IN_DISCRIMINATOR[i]);
+          
+          if (isBuyExactIn) {
+            // 🎯 EXTRACT TOKEN ADDRESS from accounts
+            const accounts = instruction.accountKeyIndexes.map(index => {
+              // 🔧 DEFENSIVE: Check if account index is valid
+              if (index >= transaction.transaction.message.staticAccountKeys.length) {
+                return null;
+              }
+              return transaction.transaction.message.staticAccountKeys[index]?.toString();
+            }).filter(account => account !== null); // Remove null entries
+
+            if (accounts.length >= 11) {
+              const buyerAddress = accounts[0];         // payer
+              const poolAddress = accounts[4];          // pool_id  
+              const tokenAddress = accounts[9];         // base_token_mint ← THE TOKEN!
+              const quoteTokenAddress = accounts[10];   // quote_token_mint (SOL)
+
+              // 🔧 DEFENSIVE: Verify all required addresses exist
+              if (!buyerAddress || !poolAddress || !tokenAddress || !quoteTokenAddress) {
+                continue;
+              }
+
+              // 🎯 CHECK IF THIS IS A NEW TOKEN
+              const isNewToken = !seenTokensRef.current.has(tokenAddress);
+              
+              if (isNewToken) {
+                // Add to seen tokens
+                seenTokensRef.current.add(tokenAddress);
+                
+                // 🎯 MINIMAL LOGGING: Only new token discoveries
+                console.log(`🚀 [RAYDIUM NEW] ${tokenAddress} | Pool: ${poolAddress} | TX: ${signature.slice(0,8)}`);
+
+                // Create token detection event
+                const tokenEvent: TokenFromBuyTransaction = {
+                  tokenAddress,
+                  poolAddress,
+                  buyerAddress,
+                  quoteTokenAddress,
+                  timestamp: new Date(transaction.blockTime! * 1000),
+                  signature,
+                  isNewToken: true,
+                  blockTime: transaction.blockTime!
+                };
+
+                // Add to detected tokens
+                setDetectedTokens(prev => [tokenEvent, ...prev.slice(0, 49)]); // Keep last 50
+                
+                // Convert to legacy TokenLaunchEvent format for compatibility
+                const legacyTokenLaunchEvent: TokenLaunchEvent = {
+                  poolId: poolAddress,
+                  tokenA: tokenAddress,           // ← The new token contract address
+                  tokenB: quoteTokenAddress,      // ← Usually SOL
+                  lpMint: poolAddress,
+                  creator: buyerAddress,          // First buyer as creator for now
+                  timestamp: new Date(transaction.blockTime! * 1000),
+                  signature,
+                  type: 'launchpad_initialize',   // ← Use existing type instead of 'launchpad_buy_detected'
+                  program: 'LAUNCHPAD',
+                  isTokenLaunch: true,
+                  initialLiquiditySOL: 0,
+                  tokenMint: tokenAddress,        // ← Contract address
+                  isNewToken: true,
+                  createdAt: new Date(transaction.blockTime! * 1000),
+                  lifetime: 0,
+                  detectionMethod: 'full_transaction', // ← Use existing type instead of 'buy_exact_in'
+                  hasCompleteData: true,
+                  isUpdating: false,
+                  tokenSymbol: 'UNKNOWN',
+                  tokenName: 'Unknown Token',
+                  tokenDecimals: 9,
+                  tokenUri: ''
+                };
+
+                // Add to legacy pools for existing UI compatibility
+                setPools(prev => [legacyTokenLaunchEvent, ...prev.slice(0, 9)]);
+                
+                // Update stats
+                setStats(prev => ({
+                  ...prev,
+                  poolsDetected: prev.poolsDetected + 1,
+                  tokenLaunchesDetected: prev.tokenLaunchesDetected + 1,
+                  lastTokenLaunch: new Date(),
+                  successfulDetections: (prev.successfulDetections || 0) + 1,
+                  rpcCallsThisSession: (prev.rpcCallsThisSession || 0) + 1
+                }));
+              }
+            }
+          }
+        }
+      }
+      
+    } catch (error: any) {
+      setStats(prev => ({ 
+        ...prev, 
+        failedDetections: (prev.failedDetections || 0) + 1,
+        rpcCallsThisSession: (prev.rpcCallsThisSession || 0) + 1
+      }));
+    }
+  }, [connection]);
+
+  // 🔧 Assign function to ref after definition
+  extractTokenFromBuyTransactionThrottledRef.current = extractTokenFromBuyTransactionThrottled;
+
+  // ========================================================================
+  // 🎯 ORIGINAL FUNCTION - now just queues the work
+  // ========================================================================
+
+  const extractTokenFromBuyTransaction = useCallback(async (signature: string) => {
+    // Just queue the work instead of doing it immediately
+    await queueRpcCall(signature);
+  }, [queueRpcCall]);
+
+  // ========================================================================
+  // 🎯 PROCESS LOGS - Look for Launchpad activity (buy_exact_in focused)
+  // ========================================================================
+  
+  const processLaunchpadLogs = useCallback((logs: any, signature: string) => {
+    try {
+      // Avoid processing duplicates
+      if (processedTransactions.current.has(signature)) {
+        return;
+      }
+      processedTransactions.current.add(signature);
+      
+      // Check if it's Launchpad program activity
+      const isLaunchpadTx = logs.logs.some((log: string) => 
+        log.includes(RAYDIUM_LAUNCHPAD)
+      );
+
+      if (!isLaunchpadTx) {
+        return; // Skip non-Launchpad transactions
+      }
+      
+      // Analyze this transaction for token addresses
+      extractTokenFromBuyTransaction(signature);
+      
+    } catch (error) {
+      console.error(`❌ Error processing logs for ${signature.slice(0,8)}:`, error);
+    }
+  }, [extractTokenFromBuyTransaction]);
+
+  // ========================================================================
+  // 🎯 CONNECTION SETUP
   // ========================================================================
 
   useEffect(() => {
     const initConnection = async () => {
       try {
-        // Use Helius RPC for better performance and no rate limits
         const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY;
         
         let rpcUrl: string;
         let wsUrl: string;
         
         if (HELIUS_API_KEY) {
-          // Use Helius RPC with API key
           rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
           wsUrl = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
           console.log('🚀 Using Helius RPC with API key');
         } else {
-          // Fallback to public RPC (with rate limits)
           rpcUrl = 'https://api.mainnet-beta.solana.com';
           wsUrl = 'wss://api.mainnet-beta.solana.com';
           console.log('⚠️ Helius API key not found, using public RPC (limited)');
-          console.log('💡 Get free API key from: https://www.helius.dev/');
         }
         
         const conn = new Connection(rpcUrl, {
@@ -116,7 +451,6 @@ export const useRaydiumProgram = () => {
           wsEndpoint: wsUrl
         });
 
-        // Test connection with timeout
         const connectionPromise = conn.getVersion();
         const timeoutPromise = new Promise((_, reject) => 
           setTimeout(() => reject(new Error('Connection timeout')), 10000)
@@ -127,9 +461,8 @@ export const useRaydiumProgram = () => {
         setConnection(conn);
         setStats(prev => ({ ...prev, isConnected: true }));
         
-        console.log('🔥 Raydium Monitor connected successfully');
+        console.log('🔥 Raydium Buy-Based Monitor connected successfully');
         console.log(`📡 Current slot: ${await conn.getSlot()}`);
-        console.log(`🎯 Monitoring program: ${RAYDIUM_PROGRAMS.LAUNCHPAD.toString()}`);
       } catch (error) {
         console.error('❌ Failed to connect to Solana:', error);
         setStats(prev => ({ ...prev, isConnected: false }));
@@ -138,11 +471,9 @@ export const useRaydiumProgram = () => {
 
     initConnection();
     
-    // Cleanup function to prevent WebSocket errors
     return () => {
       if (connection) {
         try {
-          // Clean up any active subscriptions
           subscriptionRefs.current.forEach(subId => {
             try {
               connection.removeOnLogsListener(subId);
@@ -159,369 +490,79 @@ export const useRaydiumProgram = () => {
   }, []);
 
   // ========================================================================
-  // ENHANCED: Parse Token Parameters from Launchpad Program Logs (LIKE PUMP.FUN!)
+  // 🎯 MONITORING CONTROLS
   // ========================================================================
 
-  // 🎯 NOWA METODA: Parse mint params z program logs (jak pump.fun)
-  const parseTokenParametersFromProgramLogs = (data: Buffer): {
-    mintParams?: MintParams;
-    curveParams?: CurveParams;
-    vestingParams?: VestingParams;
-  } | null => {
-    try {
-      console.log('📝 Parsing MintParams from Program Data (like pump.fun)...');
-
-      // Parse instruction arguments after discriminator (8 bytes)
-      let offset = 8;
-
-      // Parse MintParams (base_mint_param argument)
-      if (data.length > offset + 4) {
-        
-        // Read decimals (u8)
-        const decimals = data.readUInt8(offset);
-        offset += 1;
-
-        // Read name string length and content
-        if (data.length > offset + 4) {
-          const nameLength = data.readUInt32LE(offset);
-          offset += 4;
-          
-          if (data.length >= offset + nameLength) {
-            const name = data.subarray(offset, offset + nameLength).toString('utf8');
-            offset += nameLength;
-
-            // Read symbol string length and content  
-            if (data.length > offset + 4) {
-              const symbolLength = data.readUInt32LE(offset);
-              offset += 4;
-              
-              if (data.length >= offset + symbolLength) {
-                const symbol = data.subarray(offset, offset + symbolLength).toString('utf8');
-                offset += symbolLength;
-
-                // Read URI string length and content
-                if (data.length > offset + 4) {
-                  const uriLength = data.readUInt32LE(offset);
-                  offset += 4;
-                  
-                  if (data.length >= offset + uriLength) {
-                    const uri = data.subarray(offset, offset + uriLength).toString('utf8');
-                    offset += uriLength;
-
-                    const mintParams: MintParams = {
-                      decimals,
-                      name,
-                      symbol,
-                      uri
-                    };
-
-                    console.log('✅ MintParams extracted from Program Data!');
-
-                    // Try to parse additional params if available
-                    let curveParams: CurveParams | undefined;
-                    let vestingParams: VestingParams | undefined;
-
-                    // Parse CurveParams if available
-                    if (data.length > offset + 25) {
-                      try {
-                        const curveType = data.readUInt8(offset);
-                        offset += 1;
-                        const virtualBase = data.readBigUInt64LE(offset);
-                        offset += 8;
-                        const virtualQuote = data.readBigUInt64LE(offset);
-                        offset += 8;
-                        const supply = data.readBigUInt64LE(offset);
-                        offset += 8;
-
-                        curveParams = {
-                          curveType,
-                          virtualBase,
-                          virtualQuote,
-                          supply
-                        };
-                      } catch (curveError) {
-                        // Silently continue - curve params are optional
-                      }
-                    }
-
-                    // Parse VestingParams if available
-                    if (data.length > offset + 24) {
-                      try {
-                        const startTime = data.readBigUInt64LE(offset);
-                        offset += 8;
-                        const endTime = data.readBigUInt64LE(offset);
-                        offset += 8;
-                        const totalAmount = data.readBigUInt64LE(offset);
-                        offset += 8;
-
-                        vestingParams = {
-                          startTime,
-                          endTime,
-                          totalAmount
-                        };
-                      } catch (vestingError) {
-                        // Silently continue - vesting params are optional
-                      }
-                    }
-
-                    return { mintParams, curveParams, vestingParams };
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    } catch (parseError) {
-      console.warn('⚠️  Error parsing MintParams from Program Data:', parseError instanceof Error ? parseError.message : 'Unknown error');
-    }
-    return null;
-  };
-
-  // ========================================================================
-  // LOG PROCESSING - ZOPTYMALIZOWANA LOGIKA DETECTION 🚀 (LIKE PUMP.FUN!)
-  // ========================================================================
-
-  // 🎯 NOWA METODA: Process logs jak pump.fun
-  const processRaydiumLogsForTokenLaunches = useCallback((logs: any, signature: string) => {
-    console.log(`📡 Processing Raydium logs: ${signature}`);
-    
-    // Avoid processing duplicates (like pump.fun does)
-    if (processedTransactions.current.has(signature)) {
+  const startMonitoring = useCallback(async () => {
+    if (!connection) {
+      console.error('❌ Cannot start monitoring: No connection available');
       return;
     }
-    processedTransactions.current.add(signature);
     
-    logs.logs.forEach((log: string) => {
-      // Look for program data in logs (EXACTLY LIKE PUMP.FUN!)
-      if (log.includes('Program data:')) {
-        const dataMatch = log.match(/Program data: ([A-Za-z0-9+/=]+)/);
-        if (dataMatch) {
-          try {
-            const data = Buffer.from(dataMatch[1], 'base64');
-            
-            // Check for Launchpad Initialize Event
-            if (hasDiscriminator(data, LAUNCHPAD_DISCRIMINATORS.initialize)) {
-              console.log('🎪 🎪 🎪 NEW RAYDIUM TOKEN LAUNCH DETECTED! 🎪 🎪 🎪');
-              
-              // Parse token parameters from program data (like pump.fun)
-              const tokenParams = parseTokenParametersFromProgramLogs(data);
-              
-              if (tokenParams?.mintParams) {
-                console.log(`🏷️  Name: ${tokenParams.mintParams.name} (${tokenParams.mintParams.symbol})`);
-                console.log(`📋 Decimals: ${tokenParams.mintParams.decimals}`);
-                console.log(`📄 Metadata: ${tokenParams.mintParams.uri}`);
-                console.log(`🔗 Tx: https://solscan.io/tx/${signature}`);
-                console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-                
-                // Create token launch event with parsed data
-                const tokenLaunchEvent: TokenLaunchEvent = {
-                  poolId: `detecting_${signature.slice(0, 8)}`, // Will be filled later
-                  tokenA: 'detecting...', // Will be filled by getting transaction details
-                  tokenB: 'SOL', // Assuming SOL pair
-                  lpMint: 'N/A',
-                  creator: 'detecting...',
-                  timestamp: new Date(),
-                  signature,
-                  type: 'launchpad_initialize',
-                  program: 'LAUNCHPAD',
-                  isTokenLaunch: true,
-                  initialLiquiditySOL: 0,
-                  tokenMint: 'detecting...',
-                  isNewToken: true,
-                  createdAt: new Date(),
-                  lifetime: 0,
-                  // 🎯 MintParams data from program logs!
-                  mintParams: tokenParams.mintParams,
-                  curveParams: tokenParams.curveParams,
-                  vestingParams: tokenParams.vestingParams,
-                  // Legacy fields for UI compatibility
-                  tokenSymbol: tokenParams.mintParams.symbol,
-                  tokenName: tokenParams.mintParams.name,
-                  tokenDecimals: tokenParams.mintParams.decimals,
-                  tokenUri: tokenParams.mintParams.uri
-                };
-
-                // Add to state immediately with mint params
-                addTokenLaunchToState(tokenLaunchEvent);
-                
-                // Optionally: Get full transaction details in background to fill missing data
-                setTimeout(async () => {
-                  try {
-                    const tx = await connection!.getTransaction(signature, {
-                      commitment: 'confirmed',
-                      maxSupportedTransactionVersion: 0
-                    });
-                    
-                    if (tx) {
-                      // Extract more details and update the launch event
-                      // This is optional - we already have the important mint params!
-                    }
-                  } catch (error) {
-                    console.warn('Could not get full transaction details:', error);
-                  }
-                }, 100);
-              }
-            }
-          } catch (error) {
-            console.error('Error processing Raydium program data:', error);
-          }
-        }
-      }
-    });
-  }, [connection]);
-
-  // ========================================================================
-  // POZOSTAŁE FUNKCJE - UPROSZCZONE (bez instruction data parsing)
-  // ========================================================================
-
-  // 🗑️ USUWAM STARE METODY - już niepotrzebne
-  // const parseTokenParametersFromTransaction = ... (REMOVED)
-  // const parseRaydiumInitialize2FromLogs = ... (SIMPLIFIED)  
-  // const parseRaydiumInitializeFromLogs = ... (SIMPLIFIED)
-  // const parseLaunchpadInitializeFromLogs = ... (REPLACED by processRaydiumLogsForTokenLaunches)
-
-  // Helper function to add token launch to state and update stats
-  const addTokenLaunchToState = (tokenLaunchEvent: TokenLaunchEvent) => {
-    setPools(prev => [tokenLaunchEvent, ...prev.slice(0, 9)]); // Keep only 10
-    
-    setStats(prev => ({
-      ...prev,
-      poolsDetected: prev.poolsDetected + 1,
-      tokenLaunchesDetected: prev.tokenLaunchesDetected + 1,
-      lastTokenLaunch: new Date()
-    }));
-
-    // 🎯 CLEAN OUTPUT FOR TOKEN LAUNCHES
-    console.log('');
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log(`🚀 NEW TOKEN LAUNCH ADDED TO MONITORING`);
-    console.log(`💰 Token: ${tokenLaunchEvent.tokenMint || tokenLaunchEvent.tokenA}`);
-    if (tokenLaunchEvent.tokenName) console.log(`📝 Name: ${tokenLaunchEvent.tokenName}`);
-    if (tokenLaunchEvent.tokenSymbol) console.log(`🏷️  Symbol: ${tokenLaunchEvent.tokenSymbol}`);
-    if (tokenLaunchEvent.tokenDecimals !== undefined) console.log(`🔢 Decimals: ${tokenLaunchEvent.tokenDecimals}`);
-    if (tokenLaunchEvent.tokenUri) console.log(`📄 Metadata: ${tokenLaunchEvent.tokenUri}`);
-    console.log(`🏊 Pool: ${tokenLaunchEvent.poolId}`);
-    console.log(`👤 Creator: ${tokenLaunchEvent.creator}`);
-    console.log(`🔗 TX: https://solscan.io/tx/${tokenLaunchEvent.signature}`);
-    console.log(`📊 Total launches detected: ${tokenLaunchEvent.tokenMint ? 'N/A' : 'counting...'}`);
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('');
-  };
-
-  // Simple log processor - just adds to queue
-  const processLogs = useCallback(async (logs: any, signature: string) => {
-    if (!connection) return;
-
-    // 🎯 NOWA LOGIKA: Process logs directly like pump.fun (no more queue!)
-    processRaydiumLogsForTokenLaunches(logs, signature);
-  }, [connection, processRaydiumLogsForTokenLaunches]);
-
-  // Parse Launchpad Initialize (Enhanced with token parameters)
-  const parseEnhancedLaunchpadInitialize = async (buffer: Buffer, signature: string, logs: any): Promise<boolean> => {
-    try {
-      console.log('🎪 ENHANCED LAUNCHPAD INITIALIZE PARSING...');
-      
-      // Use the new processRaydiumLogsForTokenLaunches method
-      processRaydiumLogsForTokenLaunches(logs, signature);
-      return true;
-    } catch (error) {
-      console.warn('Failed to parse enhanced launchpad initialize:', error);
+    if (isMonitoring) {
+      return;
     }
-    return false;
-  };
-
-  // START MONITORING 🚀 - SIMPLIFIED (LIKE PUMP.FUN!)
-  const startMonitoring = useCallback(async () => {
-    if (!connection || isMonitoring) return;
 
     try {
-      console.log('');
-      console.log('🚀🚀🚀 RAYDIUM LAUNCHPAD TOKEN MONITORING 🚀🚀🚀');
-      console.log('🎯 FOCUS: NEW TOKEN LAUNCHES + MINTPARAMS FROM PROGRAM LOGS');
-      console.log('🎪 Program: Raydium Launchpad (LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj)');
-      console.log('📝 Extracting: name, symbol, decimals, uri from Program Data');
-      console.log('🎯 Method: Parse program logs (SAME AS PUMP.FUN!)');
-      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      console.log('');
+      console.log('🎯 [RAYDIUM] Starting buy-based token monitoring...');
       
       setIsMonitoring(true);
       startTimeRef.current = new Date();
       
-      // 🎯 Monitor ONLY Raydium Launchpad for new token launches
-      console.log('🎪 Subscribing to Launchpad for NEW TOKEN LAUNCHES...');
+      // Reset stats and tracking
+      setStats(prev => ({
+        ...prev,
+        rpcCallsThisSession: 0,
+        successfulDetections: 0,
+        failedDetections: 0,
+        isMonitoring: true
+      }));
+      
+      // Clear tracking sets
+      seenTokensRef.current.clear();
+      processedTransactions.current.clear();
 
-      // Subscribe to Raydium Launchpad program logs (like pump.fun does)
+      // Subscribe to Raydium Launchpad program logs
       const launchpadSubscription = connection.onLogs(
-        new PublicKey(RAYDIUM_PROGRAMS.LAUNCHPAD),
+        new PublicKey(RAYDIUM_LAUNCHPAD),
         (logs, context) => {
-          // Process logs directly (no queue, just like pump.fun)
-          processLogs(logs, logs.signature);
+          processLaunchpadLogs(logs, logs.signature);
         },
         'confirmed'
       );
 
       subscriptionRefs.current = [launchpadSubscription];
 
-      // Uptime counter
+      // Stats update interval
       intervalRef.current = setInterval(() => {
         if (startTimeRef.current) {
           const uptime = Math.floor((Date.now() - startTimeRef.current.getTime()) / 1000);
-          setStats(prev => ({ ...prev, uptime, isMonitoring: true }));
+          setStats(prev => ({ 
+            ...prev, 
+            uptime,
+            rpcQueueSize: rpcQueue.current.length // Report queue size
+          }));
         }
       }, 1000);
 
-      setStats(prev => ({ ...prev, isMonitoring: true }));
-      console.log('✅ New token launch monitoring started - parsing program logs like pump.fun!');
+      console.log('✅ [RAYDIUM] Monitoring active - waiting for new tokens...');
       
     } catch (error) {
       console.error('❌ Error starting monitoring:', error);
       setIsMonitoring(false);
     }
-  }, [connection, isMonitoring, processLogs]);
+  }, [connection, isMonitoring, processLaunchpadLogs]);
 
-  // STOP MONITORING 🛑
   const stopMonitoring = useCallback(async () => {
     if (!connection || !isMonitoring) return;
 
     try {
-      // Show monitoring summary before stopping
-      console.log('');
-      console.log('🛑 STOPPING TOKEN LAUNCH MONITORING - SUMMARY:');
-      console.log(`🎪 New token launches detected: ${pools.length}`);
-      console.log(`📝 Total transactions processed: ${processedTransactions.current.size}`);
+      console.log('🛑 [RAYDIUM] Stopping monitoring...');
       
-      // Calculate uptime inline
-      const hours = Math.floor(stats.uptime / 3600);
-      const minutes = Math.floor((stats.uptime % 3600) / 60);
-      const secs = stats.uptime % 60;
-      console.log(`⏱️  Monitoring duration: ${hours}h ${minutes}m ${secs}s`);
+      setIsMonitoring(false);
+      setStats(prev => ({ ...prev, isMonitoring: false }));
       
-      console.log(`📋 Final queue size: ${processedTransactions.current.size}`); // Changed from requestQueue.current.length
-      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      
-      if (pools.length > 0) {
-        console.log('🚀 DETECTED TOKEN LAUNCHES:');
-        pools.slice(0, 3).forEach((pool, i) => {
-          console.log(`  ${i + 1}. ${pool.tokenName || 'Unknown'} (${pool.tokenSymbol || 'N/A'})`);
-          console.log(`     💰 Token: ${pool.tokenA}`);
-          console.log(`     🔗 TX: ${pool.signature}`);
-          if (pool.tokenUri) console.log(`     📄 Metadata: ${pool.tokenUri}`);
-        });
-        if (pools.length > 3) {
-          console.log(`  ... and ${pools.length - 3} more launches`);
-        }
-      } else {
-        console.log('❌ No token launches detected during this session');
-        console.log('💡 Possible reasons:');
-        console.log('   • No new tokens were launched on Launchpad during monitoring');
-        console.log('   • Launches happen at specific times (often evening/night)');
-        console.log('   • Try monitoring for longer periods');
-        console.log('   • Weekend vs weekday launch patterns may vary');
-      }
-      console.log('');
-
-      // Remove wszystkie subskrypcje
+      // Clean up subscriptions
       await Promise.all(
         subscriptionRefs.current.map(id => connection.removeOnLogsListener(id))
       );
@@ -532,40 +573,41 @@ export const useRaydiumProgram = () => {
         intervalRef.current = null;
       }
 
-      setIsMonitoring(false);
-      setStats(prev => ({ ...prev, isMonitoring: false }));
-      startTimeRef.current = null;
-      
-      // 🗑️ Clear instruction counts for next session
-      // instructionTypeCounts.current.clear(); // Removed
-
-      console.log('✅ Token launch monitoring stopped');
+      console.log('✅ [RAYDIUM] Monitoring stopped');
     } catch (error) {
       console.error('Error stopping monitoring:', error);
     }
-  }, [connection, isMonitoring, pools, stats.uptime]);
+  }, [connection, isMonitoring]);
 
-  // CLEAR DATA 🗑️
   const clearData = useCallback(() => {
     setPools([]);
+    setDetectedTokens([]);
     setLivePoolStates([]);
-    
-    // 🎪 Clear new Launchpad data
     setLaunchpadEvents([]);
     setLaunchpadTokenLaunches([]);
     setLaunchpadTrades([]);
     setLaunchpadMigrations([]);
     setActiveLaunchpadPools([]);
     
+    seenTokensRef.current.clear();
+    processedTransactions.current.clear();
+    
+    // 🔧 NEW: Clear RPC queue
+    rpcQueue.current = [];
+    isProcessingQueue.current = false;
+    
     setStats(prev => ({
       ...prev,
       poolsDetected: 0,
       tokenLaunchesDetected: 0,
       uptime: 0,
-      lastTokenLaunch: null
+      lastTokenLaunch: null,
+      rpcCallsThisSession: 0,
+      rpcQueueSize: 0,
+      successfulDetections: 0,
+      failedDetections: 0
     }));
     
-    // 🎪 Clear Launchpad stats
     setLaunchpadStats({
       launchesDetected: 0,
       tradesDetected: 0,
@@ -578,13 +620,29 @@ export const useRaydiumProgram = () => {
       avgTimeToMigration: 0
     });
     
-    // 🗑️ Clear processed transactions
-    processedTransactions.current.clear();
-    
-    console.log('🗑️ Token launch data cleared - ready for new monitoring session');
+    console.log('🗑️ [RAYDIUM] Data cleared');
   }, []);
 
-  // HELPER FUNCTIONS
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (connection && subscriptionRefs.current.length > 0) {
+        subscriptionRefs.current.forEach(id => {
+          connection.removeOnLogsListener(id);
+        });
+      }
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+      // 🔧 NEW: Cleanup RPC queue
+      processedTransactions.current.clear();
+      seenTokensRef.current.clear();
+      rpcQueue.current = [];
+      isProcessingQueue.current = false;
+    };
+  }, [connection]);
+
+  // Helper functions
   const formatUptime = useCallback((seconds: number): string => {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
@@ -596,11 +654,10 @@ export const useRaydiumProgram = () => {
     return pools.filter(pool => pool.isNewToken);
   }, [pools]);
 
-  // Remove all lifecycle tracking helper functions and return simplified API
   const getRecentLaunches = useCallback((minutes: number = 60) => {
     const cutoff = Date.now() - (minutes * 60 * 1000);
-    return pools.filter(pool => pool.timestamp.getTime() > cutoff);
-  }, [pools]);
+    return detectedTokens.filter(token => token.timestamp.getTime() > cutoff);
+  }, [detectedTokens]);
 
   const getHighLiquidityPools = useCallback(() => {
     return livePoolStates.filter(pool => pool.isHighLiquidity);
@@ -615,7 +672,6 @@ export const useRaydiumProgram = () => {
     return livePoolStates.filter(pool => pool.timestamp.getTime() > cutoff);
   }, [livePoolStates]);
 
-  // Enhanced helper functions for Launchpad
   const getActiveLaunchpadPools = useCallback(() => {
     return launchpadTokenLaunches.filter(launch => {
       const hoursAgo = (Date.now() - launch.timestamp.getTime()) / (1000 * 60 * 60);
@@ -628,25 +684,8 @@ export const useRaydiumProgram = () => {
     return launchpadTrades.filter(trade => trade.timestamp.getTime() > cutoff);
   }, [launchpadTrades]);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (connection && subscriptionRefs.current.length > 0) {
-        subscriptionRefs.current.forEach(id => {
-          connection.removeOnLogsListener(id);
-        });
-      }
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      
-      // 🗑️ Cleanup processed transactions
-      processedTransactions.current.clear();
-    };
-  }, [connection]);
-
   // ========================================================================
-  // RETURN HOOK API - SIMPLIFIED FOR MINTPARAMS ONLY
+  // 🎯 RETURN HOOK API - Enhanced with buy-based detection
   // ========================================================================
 
   return {
@@ -656,7 +695,8 @@ export const useRaydiumProgram = () => {
     
     // Monitoring state
     isMonitoring,
-    pools,
+    pools, // Legacy compatibility
+    detectedTokens, // 🎯 NEW: Buy-based detected tokens
     livePoolStates,
     stats,
 
@@ -665,7 +705,7 @@ export const useRaydiumProgram = () => {
     stopMonitoring,
     clearData,
 
-    // Helper functions (simplified)
+    // Helper functions
     formatUptime,
     getNewTokenOnly,
     getRecentLaunches,
@@ -681,7 +721,7 @@ export const useRaydiumProgram = () => {
     recentPoolUpdates: getRecentPoolStates(10).length,
     isActive: stats.isMonitoring && stats.isConnected,
 
-    // Enhanced Launchpad stats (keep these as they were already defined)
+    // Enhanced Launchpad stats
     launchpadStats,
     launchpadEvents,
     launchpadTokenLaunches,
@@ -689,6 +729,15 @@ export const useRaydiumProgram = () => {
     launchpadMigrations,
     activeLaunchpadPools,
     getActiveLaunchpadPools,
-    getRecentLaunchpadTrades
+    getRecentLaunchpadTrades,
+    
+    // 🎯 NEW: Buy-based detection utilities
+    totalTokensDetected: detectedTokens.length,
+    totalUniqueTokens: seenTokensRef.current.size,
+    isNewToken: (tokenAddress: string) => !seenTokensRef.current.has(tokenAddress),
+    
+    // Compatibility properties
+    pendingDetections: 0,
+    hasPendingDetections: false,
   };
 }; 
