@@ -458,25 +458,37 @@ export const usePumpProgram = () => {
         // Use Helius RPC for better performance and no rate limits
         const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY;
         
-        if (!HELIUS_API_KEY) {
-          console.error('❌ NEXT_PUBLIC_HELIUS_API_KEY environment variable is required');
-          setMonitoringStatistics((prev: PumpMonitoringStats) => ({ ...prev, isConnected: false }));
-          return;
+        let rpcUrl: string;
+        let wsUrl: string;
+        
+        if (HELIUS_API_KEY) {
+          // Use Helius RPC with API key
+          rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+          wsUrl = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+          console.log('🚀 Using Helius RPC with API key');
+        } else {
+          // Fallback to public RPC (with rate limits)
+          rpcUrl = 'https://api.mainnet-beta.solana.com';
+          wsUrl = 'wss://api.mainnet-beta.solana.com';
+          console.log('⚠️ Helius API key not found, using public RPC (limited)');
+          console.log('💡 Get free API key from: https://www.helius.dev/');
         }
         
-        const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-        
-        const newConnection = new Connection(HELIUS_RPC_URL, {
+        const newConnection = new Connection(rpcUrl, {
           commitment: 'confirmed',
-          wsEndpoint: HELIUS_RPC_URL.replace('https://', 'wss://').replace('/?', '/websocket?')
+          wsEndpoint: wsUrl
         });
         
-        // Test connection
-        const currentSlot = await newConnection.getSlot();
-        console.log('🔥 Pump Monitor connected via Helius RPC');
+        // Test connection with timeout
+        const connectionPromise = newConnection.getSlot();
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Connection timeout')), 10000)
+        );
+        
+        const currentSlot = await Promise.race([connectionPromise, timeoutPromise]);
+        console.log('🔥 Pump Monitor connected successfully');
         console.log(`📡 Current slot: ${currentSlot}`);
         console.log(`🎯 Monitoring program: ${PUMP_FUN_PROGRAM_ID.toString()}`);
-        console.log(`🚀 Using Helius RPC for optimal performance`);
         
         setSolanaConnection(newConnection);
         setMonitoringStatistics((prev: PumpMonitoringStats) => ({ ...prev, isConnected: true }));
@@ -487,6 +499,22 @@ export const usePumpProgram = () => {
     };
 
     establishSolanaConnection();
+    
+    // Cleanup function to prevent WebSocket errors
+    return () => {
+      if (solanaConnection && logsSubscriptionRef.current) {
+        try {
+          solanaConnection.removeOnLogsListener(logsSubscriptionRef.current);
+          logsSubscriptionRef.current = null;
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+      }
+      if (uptimeIntervalRef.current) {
+        clearInterval(uptimeIntervalRef.current);
+        uptimeIntervalRef.current = null;
+      }
+    };
   }, []);
 
   // Utility: Check if buffer has specific discriminator
