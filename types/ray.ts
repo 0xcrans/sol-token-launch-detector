@@ -1,6 +1,6 @@
 /**
- * Raydium Launchpad Types - SIMPLIFIED FOR MINTPARAMS
- * Focus: New token launches with full parameters
+ * UPDATED: Raydium Launchpad Types z dwoma discriminatorami
+ * Focus: Hybrid approach - program logs + selective getTransaction
  */
 
 // ========================================================================
@@ -19,28 +19,32 @@ export const RAYDIUM_PROGRAMS = {
 } as const;
 
 // ========================================================================
-// DISCRIMINATORS - SIMPLIFIED
+// UPDATED: Dual discriminator strategy - initialize + buy_exact_in
 // ========================================================================
 
-// Raydium AMM V4 discriminators
+// Raydium AMM V4 discriminators (dla referencji)
 export const RAYDIUM_DISCRIMINATORS = {
   initialize2: new Uint8Array([95, 180, 51, 37, 242, 152, 191, 43]),
   initialize: new Uint8Array([175, 175, 109, 31, 13, 152, 155, 237])
 } as const;
 
-// CP Swap discriminators
+// CP Swap discriminators (dla referencji)
 export const CP_SWAP_DISCRIMINATORS = {
   createPool: new Uint8Array([233, 146, 209, 142, 207, 104, 64, 188])
 } as const;
 
-// Raydium Launchpad discriminators - ONLY WHAT WE NEED
+// 🎯 UPDATED: Launchpad discriminators z dwoma kluczowymi instrukcjami
 export const LAUNCHPAD_DISCRIMINATORS = {
-  // 🎯 MAIN TARGET - New token launches
+  // 🎯 GŁÓWNY TARGET - nowy token launch (tworzenie poola z tokenem)
   initialize: new Uint8Array([175, 175, 109, 31, 13, 152, 155, 237]),
   
-  // Trading (for silent ignoring)
+  // 🎯 AKTYWNOŚĆ - pierwsze zakupy mogą sygnalizować nowe tokeny
   buy_exact_in: new Uint8Array([250, 234, 13, 123, 213, 156, 19, 236]),
-  sell_exact_in: new Uint8Array([149, 39, 222, 155, 211, 124, 152, 26])
+  
+  // Dodatkowe instrukcje trading (dla kompletności)
+  sell_exact_in: new Uint8Array([149, 39, 222, 155, 211, 124, 152, 26]),
+  buy_exact_out: new Uint8Array([24, 211, 116, 40, 105, 3, 153, 56]),
+  sell_exact_out: new Uint8Array([164, 192, 149, 89, 202, 47, 54, 152])
 } as const;
 
 // ========================================================================
@@ -87,15 +91,42 @@ export interface VestingParams {
 }
 
 // ========================================================================
-// TOKEN LAUNCH EVENT - SIMPLIFIED
+// ENHANCED: Hybrid detection types
+// ========================================================================
+
+export interface LaunchpadActivity {
+  signature: string;
+  timestamp: Date;
+  activityType: 'initialize' | 'buy_exact_in' | 'sell_exact_in' | 'first_trade';
+  tokenAddress?: string;
+  poolAddress?: string;
+  userAddress?: string;
+  amount?: number;
+  mintParams?: MintParams;
+  detectionMethod: 'program_logs' | 'full_transaction';
+}
+
+export interface TokenLaunchDetection {
+  signature: string;
+  timestamp: Date;
+  detectionMethod: 'initialize_logs' | 'buy_exact_in_logs' | 'full_transaction';
+  hasCompleteData: boolean;
+  tokenAddress?: string;
+  mintParams?: MintParams;
+  needsFollowUp: boolean; // czy potrzeba getTransaction dla pełnych danych
+  priority: 'high' | 'medium' | 'low'; // priorytet dla RPC queue
+}
+
+// ========================================================================
+// TOKEN LAUNCH EVENT - ENHANCED FOR HYBRID APPROACH
 // ========================================================================
 
 export interface TokenLaunchEvent {
   poolId: string;
-  tokenA: string;       // New token
+  tokenA: string;       // New token (może być 'detecting...' initially)
   tokenB: string;       // SOL/USDC
   lpMint: string;
-  creator: string;
+  creator: string;      // może być 'detecting...' initially
   timestamp: Date;
   signature: string;
   type: 'initialize2' | 'createPool' | 'launchpad_initialize';
@@ -103,10 +134,15 @@ export interface TokenLaunchEvent {
   isTokenLaunch: boolean;
   initialLiquiditySOL?: number;
   
-  // 🎯 MAIN FOCUS: Token parameters from MintParams
+  // 🎯 MAIN FOCUS: Token parameters from MintParams (available immediately from logs)
   mintParams?: MintParams;
   curveParams?: CurveParams;
   vestingParams?: VestingParams;
+  
+  // 🎯 NEW: Detection metadata
+  detectionMethod?: 'program_logs' | 'full_transaction' | 'hybrid';
+  hasCompleteData?: boolean; // czy wszystkie dane są wypełnione
+  isUpdating?: boolean; // czy czeka na async update z getTransaction
   
   // Legacy compatibility fields
   tokenMint?: string;
@@ -120,7 +156,7 @@ export interface TokenLaunchEvent {
 }
 
 // ========================================================================
-// MONITORING STATS - SIMPLIFIED
+// MONITORING STATS - ENHANCED
 // ========================================================================
 
 export interface MonitoringStats {
@@ -130,13 +166,18 @@ export interface MonitoringStats {
   tokenLaunchesDetected: number;
   uptime: number;
   lastTokenLaunch: Date | null;
+  
+  // 🎯 NEW: Performance stats
+  rpcCallsThisSession?: number;
+  rpcQueueSize?: number;
+  successfulDetections?: number;
+  failedDetections?: number;
 }
 
 // ========================================================================
-// LAUNCHPAD EVENT TYPES - MINIMAL
+// LAUNCHPAD EVENT TYPES - MINIMAL (zachowane dla compatibility)
 // ========================================================================
 
-// Basic launchpad types (keep for compatibility)
 export interface LaunchpadTokenLaunch {
   poolState: string;
   baseMint: string;
@@ -203,7 +244,7 @@ export type LaunchpadEvent =
   | LaunchpadLivePoolState;
 
 // ========================================================================
-// HELPER FUNCTIONS
+// ENHANCED HELPER FUNCTIONS
 // ========================================================================
 
 export function hasDiscriminator(data: Buffer | Uint8Array, discriminator: Uint8Array): boolean {
@@ -222,4 +263,56 @@ export function isTokenLaunch(tokenA: string, tokenB: string): boolean {
   
   // Token launch = one token is common, other is not
   return (aIsCommon && !bIsCommon) || (!aIsCommon && bIsCommon);
+}
+
+/**
+ * 🎯 NEW: Determine if instruction is token-related
+ */
+export function isTokenRelatedInstruction(discriminator: Uint8Array): boolean {
+  return (
+    hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.initialize) ||
+    hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.buy_exact_in) ||
+    hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.sell_exact_in)
+  );
+}
+
+/**
+ * 🎯 NEW: Get instruction type from discriminator
+ */
+export function getInstructionType(discriminator: Uint8Array): string {
+  if (hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.initialize)) {
+    return 'initialize';
+  }
+  if (hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.buy_exact_in)) {
+    return 'buy_exact_in';
+  }
+  if (hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.sell_exact_in)) {
+    return 'sell_exact_in';
+  }
+  if (hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.buy_exact_out)) {
+    return 'buy_exact_out';
+  }
+  if (hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.sell_exact_out)) {
+    return 'sell_exact_out';
+  }
+  return 'unknown';
+}
+
+/**
+ * 🎯 NEW: Check if discriminator indicates new token launch
+ */
+export function isNewTokenLaunchInstruction(discriminator: Uint8Array): boolean {
+  return hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.initialize);
+}
+
+/**
+ * 🎯 NEW: Check if discriminator indicates trading activity
+ */
+export function isTradingInstruction(discriminator: Uint8Array): boolean {
+  return (
+    hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.buy_exact_in) ||
+    hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.sell_exact_in) ||
+    hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.buy_exact_out) ||
+    hasDiscriminator(discriminator, LAUNCHPAD_DISCRIMINATORS.sell_exact_out)
+  );
 } 
