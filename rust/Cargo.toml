@@ -1,0 +1,35 @@
+[package]
+name = "blazing-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+
+# WebSocket
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP client for RPC calls
+reqwest = { version = "0.11", features = ["json"] }
+
+# JSON handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Base64 encoding/decoding
+base64 = "0.21"
+
+# Solana SDK
+solana-sdk = "1.17"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Environment variables
+dotenv = "0.15"
